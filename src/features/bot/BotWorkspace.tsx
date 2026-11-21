@@ -120,7 +120,7 @@ export const BotWorkspace = ({ onBack }: BotWorkspaceProps) => {
   const blocklyDivRef = useRef<HTMLDivElement>(null);
   const workspaceRef = useRef<Blockly.WorkspaceSvg | null>(null);
 
-  const { balances, updateOptionsBalance, activeMode, winAccuracy } = useAccount();
+  const { balances, updateOptionsBalance, activeMode, winAccuracy, flushPending } = useAccount();
 
   // Simulation Runner State
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
@@ -255,6 +255,7 @@ export const BotWorkspace = ({ onBack }: BotWorkspaceProps) => {
   const handleToggleRun = () => {
     if (isSimulating) {
       showStopToast();
+      flushPending();
       isSimulatingRef.current = false;
       setIsSimulating(false);
       
@@ -408,7 +409,13 @@ export const BotWorkspace = ({ onBack }: BotWorkspaceProps) => {
     await new Promise((r) => setTimeout(r, 800));
     if (!isSimulatingRef.current) return;
 
-    updateOptionsBalance(-stake);
+    if (!Number.isFinite(stake) || stake <= 0 || !updateOptionsBalance(-stake)) {
+      isSimulatingRef.current = false;
+      setIsSimulating(false);
+      setSimPhase('IDLE');
+      window.alert('Simulated trade not placed: stake exceeds available Options balance or changes could not be saved.');
+      return;
+    }
     setTotalStake((prev) => parseFloat((prev + stake).toFixed(2)));
     setNumberOfRuns((prev) => prev + 1);
 
