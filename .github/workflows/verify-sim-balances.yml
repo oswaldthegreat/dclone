@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - feature/per-user-sim-balance-sync
+      - main
   workflow_dispatch:
 
 jobs:

@@ -108,8 +108,33 @@ export const AccountProvider: React.FC<{ userId: string; children: React.ReactNo
         if (!cancelled) setInitialError(error instanceof Error ? error.message : 'Unable to initialize balances');
       }
     };
-    void initialize();
-    return () => { cancelled = true; readyRef.current = false; };
+    // One active tab per browser profile: localStorage is not a transactional multi-tab queue.
+    // The Web Locks API prevents two tabs issuing the same client sequence.
+    let releaseLock: (() => void) | null = null;
+    if (navigator.locks?.request) {
+      void navigator.locks.request('dclone-sim-wallet:' + userId, { mode: 'exclusive', ifAvailable: true }, async lock => {
+        if (!lock) {
+          if (!cancelled) setInitialError('This simulated account is open in another tab. Close that tab and try again.');
+          return;
+        }
+        if (cancelled) return;
+        await initialize();
+        await new Promise<void>(resolve => {
+          releaseLock = resolve;
+          if (cancelled) resolve();
+        });
+      }).catch(error => {
+        if (!cancelled) setInitialError(error instanceof Error ? error.message : 'Unable to lock the account');
+      });
+    } else {
+      // Older browsers lack Web Locks. Use only one tab on those browsers.
+      void initialize();
+    }
+    return () => {
+      cancelled = true;
+      readyRef.current = false;
+      releaseLock?.();
+    };
   }, [userId, retry, publish, updatePendingCount]);
 
   const record = useCallback((mode: AccountMode, event: NewSimBalanceEvent): boolean => {
