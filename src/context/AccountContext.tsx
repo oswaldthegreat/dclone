@@ -18,6 +18,7 @@ export interface AccountBalances {
 }
 export type AccountMode = 'real' | 'demo';
 export type AccountKey = 'cfdsUsd' | 'optionsUsd' | 'walletUsd' | 'walletUsdt' | 'p2pUsd';
+export type BalanceSyncTargets = Partial<Record<AccountMode, number>>;
 export interface AccountContextType {
   activeMode: AccountMode;
   setActiveMode: (mode: AccountMode) => void;
@@ -25,8 +26,11 @@ export interface AccountContextType {
   realBalances: AccountBalances;
   demoBalances: AccountBalances;
   updateOptionsBalance: (deltaOrValue: number, isAbsolute?: boolean) => boolean;
-  adminOverrideBalances: (realUpdates: Partial<AccountBalances>, demoUpdates?: Partial<AccountBalances>) => void;
+  adminOverrideBalances: (realUpdates: Partial<AccountBalances>, demoUpdates?: Partial<AccountBalances>) => BalanceSyncTargets;
   transferFunds: (fromKey: AccountKey, toKey: AccountKey, amount: number) => boolean;
+  queueTransferFunds: (fromKey: AccountKey, toKey: AccountKey, amount: number) => BalanceSyncTargets;
+  confirmBalanceChanges: (targets: BalanceSyncTargets) => Promise<void>;
+  refreshBalances: () => Promise<void>;
   flushPending: () => void;
   syncError: string | null;
   pendingCount: number;
@@ -47,7 +51,9 @@ export const AccountProvider: React.FC<{ userId: string; children: React.ReactNo
   const queuesRef = useRef<Queues | null>(null);
   const clientIdRef = useRef('');
   const readyRef = useRef(false);
-  const inFlightRef = useRef<Record<AccountMode, boolean>>({ real: false, demo: false });
+  const flushTasksRef = useRef<Record<AccountMode, Promise<void> | null>>({ real: null, demo: null });
+  const refreshTaskRef = useRef<Promise<void> | null>(null);
+  const snapshotPausedRef = useRef(false);
   const [ready, setReady] = useState(false);
   const [initialError, setInitialError] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -137,71 +143,155 @@ export const AccountProvider: React.FC<{ userId: string; children: React.ReactNo
     };
   }, [userId, retry, publish, updatePendingCount]);
 
-  const record = useCallback((mode: AccountMode, event: NewSimBalanceEvent): boolean => {
+  const queueEvents = useCallback((mode: AccountMode, events: NewSimBalanceEvent[]): number => {
     const queues = queuesRef.current;
-    if (!readyRef.current || !queues) return false;
-    const old = queues[mode];
-    if (old.events.length >= 5000) {
-      setSyncError('Too many unsent simulated changes. Trading paused until they sync.');
-      return false;
+    if (!readyRef.current || !queues) throw new Error('Balances are not ready');
+    const current = queues[mode];
+    if (current.events.length + events.length > 5000) {
+      throw new Error('Too many unsent changes. Please reconnect before continuing.');
     }
-    const entry = { ...event, seq: old.lastIssued + 1 };
-    try {
-      const nextBalances = applySimEvent(balancesRef.current[mode], entry);
-      const nextQueue: StoredSimQueue = {
-        ...old, lastIssued: entry.seq, events: [...old.events, entry],
-      };
-      // Persist first, so no trade is ever shown without a locally stored change.
-      saveSimQueue(userId, mode, nextQueue);
-      queues[mode] = nextQueue;
-      publish(mode, nextBalances);
-      updatePendingCount();
-      return true;
-    } catch (error) {
-      setSyncError(error instanceof Error ? error.message : 'Unable to save pending balance change');
-      return false;
-    }
+    let projected = balancesRef.current[mode];
+    const sequenced = events.map((event, index) => ({
+      ...event, seq: current.lastIssued + index + 1,
+    }));
+    for (const event of sequenced) projected = applySimEvent(projected, event);
+    if (!sequenced.length) return current.lastIssued;
+    const nextQueue: StoredSimQueue = {
+      ...current,
+      lastIssued: sequenced[sequenced.length - 1].seq,
+      events: [...current.events, ...sequenced],
+    };
+    // Persist all changes in this mode together BEFORE publishing React state.
+    saveSimQueue(userId, mode, nextQueue);
+    queues[mode] = nextQueue;
+    publish(mode, projected);
+    updatePendingCount();
+    return nextQueue.lastIssued;
   }, [userId, publish, updatePendingCount]);
 
-  const flushMode = useCallback(async (mode: AccountMode) => {
-    const queues = queuesRef.current;
-    if (!readyRef.current || !queues || inFlightRef.current[mode]) return;
-    const batch = queues[mode].events.slice(0, 500);
-    if (!batch.length) return;
-    inFlightRef.current[mode] = true;
+  const record = useCallback((mode: AccountMode, event: NewSimBalanceEvent): boolean => {
     try {
-      const { data, error } = await supabase.rpc('dclone_sim_apply_batch', {
-        p_client_id: clientIdRef.current, p_mode: mode, p_events: batch,
-      });
-      if (error) throw error;
-      if (!readyRef.current || !queuesRef.current) return;
-      const response = data as { last_sequence: number; balances: unknown };
-      const confirmed = Number(response.last_sequence);
-      if (!Number.isSafeInteger(confirmed) || confirmed < batch[batch.length - 1].seq) {
-        throw new Error('Database did not acknowledge the complete batch');
-      }
-      const nextQueue = reconcileSimQueue(queuesRef.current[mode], confirmed);
-      const base = balancesFromRows(response.balances, mode);
-      const nextView = nextQueue.events.reduce(applySimEvent, base);
-      // If this write fails, the server cursor still makes retries harmless.
-      saveSimQueue(userId, mode, nextQueue);
-      queuesRef.current[mode] = nextQueue;
-      publish(mode, nextView);
-      updatePendingCount();
-      setSyncError(null);
+      queueEvents(mode, [event]);
+      return true;
     } catch (error) {
-      if (readyRef.current) {
-        setSyncError('Balance sync pending: ' + (error instanceof Error ? error.message : String(error)));
-      }
-    } finally {
-      inFlightRef.current[mode] = false;
+      setSyncError(error instanceof Error ? error.message : 'Unable to record balance adjustment');
+      return false;
     }
+  }, [queueEvents]);
+
+  const flushMode = useCallback((mode: AccountMode): Promise<void> => {
+    if (flushTasksRef.current[mode]) return flushTasksRef.current[mode]!;
+    if (!readyRef.current || !queuesRef.current || snapshotPausedRef.current) return Promise.resolve();
+    const batch = queuesRef.current[mode].events.slice(0, 500);
+    if (!batch.length) return Promise.resolve();
+
+    const task = (async () => {
+      try {
+        const { data, error } = await supabase.rpc('dclone_sim_apply_batch', {
+          p_client_id: clientIdRef.current, p_mode: mode, p_events: batch,
+        });
+        if (error) throw error;
+        if (!readyRef.current || !queuesRef.current) throw new Error('Account session changed');
+        const response = data as { last_sequence: number; balances: unknown };
+        const confirmed = Number(response.last_sequence);
+        if (!Number.isSafeInteger(confirmed) || confirmed < batch[batch.length - 1].seq) {
+          throw new Error('Database did not acknowledge the complete batch');
+        }
+        const updatedQueue = reconcileSimQueue(queuesRef.current[mode], confirmed);
+        const confirmedBalances = balancesFromRows(response.balances, mode);
+        const displayBalances = updatedQueue.events.reduce(applySimEvent, confirmedBalances);
+        saveSimQueue(userId, mode, updatedQueue);
+        queuesRef.current[mode] = updatedQueue;
+        publish(mode, displayBalances);
+        updatePendingCount();
+        setSyncError(null);
+      } catch (error) {
+        if (readyRef.current) {
+          setSyncError('Balance sync pending: ' + (error instanceof Error ? error.message : String(error)));
+        }
+        throw error;
+      }
+    })();
+    flushTasksRef.current[mode] = task;
+    const clear = () => {
+      if (flushTasksRef.current[mode] === task) flushTasksRef.current[mode] = null;
+    };
+    void task.then(clear, clear);
+    return task;
   }, [userId, publish, updatePendingCount]);
 
   const flushPending = useCallback(() => {
-    void flushMode('real');
-    void flushMode('demo');
+    // Background syncing never produces unhandled promise rejections.
+    void flushMode('real').catch(() => undefined);
+    void flushMode('demo').catch(() => undefined);
   }, [flushMode]);
+
+  const refreshBalances = useCallback(async (): Promise<void> => {
+    if (!readyRef.current || !queuesRef.current) throw new Error('Balances are not ready yet');
+    if (refreshTaskRef.current) return refreshTaskRef.current;
+
+    const task = (async () => {
+      // First make a best-effort attempt to save pending work; even if offline,
+      // the snapshot can be safely combined with the unsent local queue.
+      await Promise.allSettled(simModes.map(mode => flushMode(mode)));
+      // Pause new batch sends while reading the snapshot, but not local trading.
+      snapshotPausedRef.current = true;
+      await Promise.allSettled(simModes.map(mode => flushTasksRef.current[mode]).filter(
+        (promise): promise is Promise<void> => promise !== null,
+      ));
+      const { data, error } = await supabase.rpc('dclone_sim_snapshot', {
+        p_client_id: clientIdRef.current,
+      });
+      if (error) throw error;
+      if (!readyRef.current || !queuesRef.current) throw new Error('Account session changed');
+
+      const snapshot = data as { balances: unknown; cursors: Record<AccountMode, number> };
+      // Use the CURRENT queues: the bot may have appended changes during the fetch.
+      const current = queuesRef.current;
+      const updatedQueues: Queues = {
+        real: reconcileSimQueue(current.real, Number(snapshot.cursors?.real)),
+        demo: reconcileSimQueue(current.demo, Number(snapshot.cursors?.demo)),
+      };
+      const updatedBalances: ModesBalances = {
+        real: updatedQueues.real.events.reduce(applySimEvent, balancesFromRows(snapshot.balances, 'real')),
+        demo: updatedQueues.demo.events.reduce(applySimEvent, balancesFromRows(snapshot.balances, 'demo')),
+      };
+      saveSimQueue(userId, 'real', updatedQueues.real);
+      saveSimQueue(userId, 'demo', updatedQueues.demo);
+      queuesRef.current = updatedQueues;
+      publish('real', updatedBalances.real);
+      publish('demo', updatedBalances.demo);
+      updatePendingCount();
+      if (!updatedQueues.real.events.length && !updatedQueues.demo.events.length) setSyncError(null);
+    })();
+
+    refreshTaskRef.current = task;
+    try {
+      await task;
+    } finally {
+      if (refreshTaskRef.current === task) refreshTaskRef.current = null;
+      snapshotPausedRef.current = false;
+    }
+  }, [flushMode, userId, publish, updatePendingCount]);
+
+  const confirmBalanceChanges = useCallback(async (targets: BalanceSyncTargets): Promise<void> => {
+    const waitForMode = async (mode: AccountMode, target: number) => {
+      if (!Number.isSafeInteger(target) || target < 0) throw new Error('Invalid confirmation target');
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (!readyRef.current || !queuesRef.current) throw new Error('Session changed during balance sync');
+        if (!queuesRef.current[mode].events.some(event => event.seq <= target)) return;
+        // Never spin on the queue while another snapshot is holding the sync gate.
+        if (refreshTaskRef.current) await refreshTaskRef.current;
+        await flushMode(mode);
+      }
+      throw new Error('Balance updates are still pending; please retry confirmation.');
+    };
+    await Promise.all(simModes.map(mode =>
+      targets[mode] === undefined ? Promise.resolve() : waitForMode(mode, targets[mode]!),
+    ));
+    // A fresh database snapshot, not just the batch response, confirms the UI.
+    await refreshBalances();
+  }, [flushMode, refreshBalances]);
 
   useEffect(() => {
     if (!ready) return;
@@ -231,18 +321,42 @@ export const AccountProvider: React.FC<{ userId: string; children: React.ReactNo
     } catch { return false; }
   };
 
+  const queueTransferFunds = (fromKey: AccountKey, toKey: AccountKey, amount: number): BalanceSyncTargets => {
+    if (fromKey === toKey || !Number.isFinite(amount) || amount <= 0) throw new Error('Invalid transfer');
+    const mode = activeMode;
+    const seq = queueEvents(mode, [{
+      kind: 'transfer', from: fromKey, to: toKey, amount_cents: cents(amount),
+    }]);
+    return { [mode]: seq };
+  };
+
   const adminOverrideBalances = (
-    realUpdates: Partial<AccountBalances>, demoUpdates: Partial<AccountBalances> = {},
-  ) => {
+    realUpdates: Partial<AccountBalances>,
+    demoUpdates: Partial<AccountBalances> = {},
+  ): BalanceSyncTargets => {
+    const targets: BalanceSyncTargets = {};
+    const accounts: AccountKey[] = ['optionsUsd', 'cfdsUsd', 'walletUsd', 'walletUsdt', 'p2pUsd'];
+    // Validate BOTH forms before queueing anything, so invalid inputs cannot partially apply.
+    const updatesByMode: Record<AccountMode, NewSimBalanceEvent[]> = {
+      real: [],
+      demo: [],
+    };
     for (const [mode, updates] of [['real', realUpdates], ['demo', demoUpdates]] as const) {
-      for (const account of ['optionsUsd', 'cfdsUsd', 'walletUsd', 'walletUsdt', 'p2pUsd'] as AccountKey[]) {
+      for (const account of accounts) {
         const value = updates[account];
         if (value !== undefined) {
-          try { record(mode, { kind: 'set', account, cents: cents(value) }); }
-          catch { setSyncError('Invalid simulated admin balance'); }
+          const amount = cents(value);
+          if (amount < 0) throw new Error('Simulated balance must be non-negative');
+          updatesByMode[mode].push({ kind: 'set', account, cents: amount });
         }
       }
     }
+    for (const mode of simModes) {
+      if (updatesByMode[mode].length) {
+        targets[mode] = queueEvents(mode, updatesByMode[mode]);
+      }
+    }
+    return targets;
   };
 
   const balances = activeMode === 'real' ? realBalances : demoBalances;
@@ -264,7 +378,8 @@ export const AccountProvider: React.FC<{ userId: string; children: React.ReactNo
   return (
     <AccountContext.Provider value={{
       activeMode, setActiveMode, balances, realBalances, demoBalances,
-      updateOptionsBalance, adminOverrideBalances, transferFunds, flushPending,
+      updateOptionsBalance, adminOverrideBalances, transferFunds, queueTransferFunds,
+      confirmBalanceChanges, refreshBalances, flushPending,
       syncError, pendingCount, winAccuracy, setWinAccuracy,
     }}>
       {children}
