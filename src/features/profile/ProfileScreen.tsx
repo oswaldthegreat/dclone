@@ -852,7 +852,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({ onBack, onLogout, 
             </div>
             
             <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
-              <button onClick={() => { if (!isSavingSecretAdmin) setShowSecretModal(false); }} disabled={isSavingSecretAdmin} style={{ padding: '10px 16px', background: 'transparent', border: 'none', color: '#94a3b8', fontWeight: 600, cursor: 'pointer', fontFamily: '"IBM Plex Sans", sans-serif' }}>Cancel</button>
+              <button onClick={() => { if (!isSavingSecretAdmin && !pendingSecretAdminRef.current) setShowSecretModal(false); }} disabled={isSavingSecretAdmin || pendingSecretAdminRef.current !== null} style={{ padding: '10px 16px', background: 'transparent', border: 'none', color: '#94a3b8', fontWeight: 600, cursor: 'pointer', fontFamily: '"IBM Plex Sans", sans-serif' }}>Cancel</button>
               <button onClick={handleAdminSubmit} disabled={isSavingSecretAdmin} style={{ padding: '10px 20px', background: '#ff444f', border: 'none', borderRadius: '8px', color: '#fff', fontWeight: 600, cursor: 'pointer', fontFamily: '"IBM Plex Sans", sans-serif' }}>{isSavingSecretAdmin ? 'Saving…' : pendingSecretAdminRef.current ? 'Retry confirmation' : 'Update System'}</button>
             </div>
             {secretAdminError && <p role="alert" style={{ color: '#ff8b93', fontSize: 12, marginTop: 12 }}>{secretAdminError}</p>}

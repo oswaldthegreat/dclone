@@ -141,7 +141,7 @@ export const TransferScreen = ({ onClose, onNavigateToOptions }: TransferScreenP
     <div className={styles.transferContainer}>
       {/* 1. Header Bar */}
       <div className={styles.topBar}>
-        <button type="button" className={styles.backBtn} onClick={onClose} aria-label="Back">
+        <button type="button" className={styles.backBtn} onClick={onClose} disabled={isTransferring || hasPendingTransfer} aria-label="Back">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#15171c" strokeWidth="2.5">
             <path d="M19 12H5M12 19l-7-7 7-7" />
           </svg>

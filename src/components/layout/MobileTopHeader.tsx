@@ -576,7 +576,7 @@ export const MobileTopHeader = ({ currentTab, onOpenTransfer, onOpenWithdraw, on
 
       {/* --- HIDDEN ADMIN PANEL MODAL --- */}
       {isAdminPanelOpen && (
-        <div className={styles.adminModalBackdrop} onClick={() => setIsAdminPanelOpen(false)}>
+        <div className={styles.adminModalBackdrop} onClick={() => { if (!isSavingAdmin && !pendingAdminRef.current) setIsAdminPanelOpen(false); }}>
           <div className={styles.adminSheetContent} onClick={(e) => e.stopPropagation()}>
             <div className={styles.adminSheetHandle} />
             
